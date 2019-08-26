@@ -7,6 +7,8 @@
  * Version 2. See the file COPYING for more details.
  */
 
+// #define DEBUG				1	// 2017.02.13:NEB:Remove this for production
+
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -24,8 +26,8 @@ MODULE_AUTHOR("Jean-Francois Dagenais <dagenaisj@sonatest.com>");
 MODULE_DESCRIPTION("w1 family 29 driver for DS2408 8 Pin IO");
 MODULE_ALIAS("w1-family-" __stringify(W1_FAMILY_DS2408));
 
-
 #define W1_F29_RETRIES		3
+#define W1_F29_BLOCK_WRITE_MAX              256 /* max block write size */
 
 #define W1_F29_REG_LOGIG_STATE             0x88 /* R */
 #define W1_F29_REG_OUTPUT_LATCH_STATE      0x89 /* R */
@@ -42,6 +44,15 @@ MODULE_ALIAS("w1-family-" __stringify(W1_FAMILY_DS2408));
 #define W1_F29_FUNC_RESET_ACTIVITY_LATCHES 0xC3
 
 #define W1_F29_SUCCESS_CONFIRM_BYTE        0xAA
+
+/*
+Private, per-device storage. Used to capture the responses
+during block_write(), to be returned on call to block_read().
+*/
+struct w1_f29_family_data {
+	size_t block_write_response_size;
+	char block_write_response[ W1_F29_BLOCK_WRITE_MAX ];
+};
 
 static int _read_reg(struct w1_slave *sl, u8 address, unsigned char* buf)
 {
@@ -91,10 +102,34 @@ static ssize_t output_read(struct file *filp, struct kobject *kobj,
 	dev_dbg(&kobj_to_w1_slave(kobj)->dev,
 		"Reading %s kobj: %p, off: %0#10x, count: %zu, buff addr: %p",
 		bin_attr->attr.name, kobj, (unsigned int)off, count, buf);
+
 	if (count != 1 || off != 0)
 		return -EFAULT;
+
 	return _read_reg(kobj_to_w1_slave(kobj),
 					 W1_F29_REG_OUTPUT_LATCH_STATE, buf);
+}
+
+static ssize_t block_read(struct file *filp, struct kobject *kobj,
+			   struct bin_attribute *bin_attr, char *buf,
+			   loff_t off, size_t count)
+{
+	struct w1_slave *sl = kobj_to_w1_slave(kobj);
+	struct w1_f29_family_data* instance_data =
+		( struct w1_f29_family_data* ) sl->family_data;
+	size_t number_of_bytes = min( count, instance_data->block_write_response_size );
+	dev_dbg( &sl->dev,
+		"block_read: %s kobj: %p, off: %0#10x, count: %zu, buff addr: %p",
+		bin_attr->attr.name, kobj, (unsigned int)off, number_of_bytes, buf);
+
+	if ( count > W1_F29_BLOCK_WRITE_MAX )
+	{
+		return -EFAULT;
+	}
+	memcpy( buf, instance_data->block_write_response, number_of_bytes );
+	//memset( instance_data->block_write_response, 0, number_of_bytes );
+	instance_data->block_write_response_size = 0;
+	return number_of_bytes;
 }
 
 static ssize_t activity_read(struct file *filp, struct kobject *kobj,
@@ -195,7 +230,6 @@ static ssize_t output_write(struct file *filp, struct kobject *kobj,
 		w1_write_block(sl->master, w1_buf, 3);
 		/* read the result of the READ_PIO_REGS command */
 		if (w1_read_8(sl->master) == *buf)
-#endif
 		{
 			/* success! */
 			mutex_unlock(&sl->master->bus_mutex);
@@ -203,13 +237,120 @@ static ssize_t output_write(struct file *filp, struct kobject *kobj,
 				"mutex unlocked, retries:%d", retries);
 			return 1;
 		}
+#else
+		/*
+		 * Protocol requires that we read the reply.
+		 * It was never intended that the reply be
+		 * compared to the byte sent.
+		 */
+		w1_read_8(sl->master);
+		mutex_unlock(&sl->master->bus_mutex);
+		dev_dbg(&sl->dev,
+			"mutex unlocked, retries:%d", retries);
+		return 1;
+#endif
 	}
 error:
 	mutex_unlock(&sl->master->bus_mutex);
-	dev_dbg(&sl->dev, "mutex unlocked in error, retries:%d", retries);
+	dev_dbg(&sl->dev,
+		"mutex unlocked in error, retries:%d", retries);
 
 	return -EIO;
 }
+
+/*
+Use "channel write" function to write multiple bytes in a single operation. 
+After writing each byte, we read the response and save it in private storage,
+to be returned at the next block_read() call.
+*/
+static ssize_t block_write_bytes( struct kobject *kobj, char* out,
+			int number_of_bytes )
+{
+	struct w1_slave *sl = kobj_to_w1_slave( kobj );
+	struct w1_f29_family_data* instance_data =
+		( struct w1_f29_family_data* ) sl->family_data;
+	u8* in = instance_data->block_write_response;
+	char* end;
+	char confirm;
+
+	dev_dbg( &sl->dev, "block_write_bytes: %d bytes", number_of_bytes );
+	w1_write_8( sl->master, W1_F29_FUNC_CHANN_ACCESS_WRITE );
+	for ( end = out + number_of_bytes; out < end; ++out, ++in )
+	{
+		char w1_buf[ 2 ] = { *out, ~( *out ) };
+		dev_dbg( &sl->dev, "writing byte: 0x%02x", *out );
+		w1_write_block( sl->master, w1_buf, 2 );
+		confirm = w1_read_8( sl->master );
+		dev_dbg( &sl->dev, "output_write: confirmation 0x%02x", confirm );
+		if ( confirm != W1_F29_SUCCESS_CONFIRM_BYTE )
+		{
+			return 0;
+		}
+		*in = w1_read_8( sl->master );
+		dev_dbg( &sl->dev, "output_write: response: 0x%02x", *in );
+	}
+	instance_data->block_write_response_size = number_of_bytes;
+	return number_of_bytes;
+}
+
+/*
+I'm not sure all this is necessary, but the original author seemed to think it was.
+Retry doesn't really make much sense, unless the other half of the conversation
+knows what to expect.
+*/
+static ssize_t block_write(struct file *filp, struct kobject *kobj,
+			    struct bin_attribute *bin_attr, char *buf,
+			    loff_t off, size_t count)
+{
+	struct w1_slave *sl = kobj_to_w1_slave(kobj);
+	bool okay;
+	int retries;
+
+	if ( count > W1_F29_BLOCK_WRITE_MAX )
+	{
+		return -EFAULT;
+	}
+
+	dev_dbg(&sl->dev, "locking mutex for block_write");
+	mutex_lock(&sl->master->bus_mutex);
+	dev_dbg(&sl->dev, "mutex locked");
+
+	dev_dbg(&sl->dev,
+		"block_write: off: %d, count: %d", ( int ) off, ( int ) count );
+
+	if (w1_reset_select_slave(sl))
+	{
+		goto error;
+	}
+
+	for ( retries = W1_F29_RETRIES; retries > 0; --retries )
+	{
+		size_t bytes_written = block_write_bytes( kobj, &buf[ off ], count );
+		dev_dbg(&sl->dev, "block_write: bytes_written: %d", bytes_written );
+		okay = ( bytes_written == count );
+		if ( okay )
+		{
+			break;
+		}
+		if ( !w1_reset_resume_command(sl->master) )
+		{
+			break;
+		}
+	}
+	if ( okay )
+	{
+		/* success! */
+		mutex_unlock(&sl->master->bus_mutex);
+		dev_dbg(&sl->dev, "success after %d attempt", W1_F29_RETRIES - retries);
+		return count;
+	}
+
+error:
+	mutex_unlock(&sl->master->bus_mutex);
+	dev_dbg(&sl->dev, "mutex unlocked in error, retries:%d", retries);
+	return -EIO;
+}
+
 
 
 /**
@@ -316,8 +457,41 @@ out:
 	return res;
 }
 
+/*
+Allocate storage space for private, per-device data.
+*/
+static int w1_f29_add_slave(struct w1_slave *sl)
+{
+	dev_dbg( &sl->dev, "w1_f29_add_slave" );
+	dev_dbg( &sl->dev, "family_data: before: 0x%08x", ( unsigned int ) sl->family_data );
+
+	sl->family_data = kzalloc(sizeof(struct w1_f29_family_data), GFP_KERNEL);
+	if (!sl->family_data)
+	{
+		return -ENOMEM;
+	}
+	dev_dbg( &sl->dev, "family_data:  after: 0x%08x", ( unsigned int ) sl->family_data );
+	return w1_f29_disable_test_mode(sl);
+}
+
+static void w1_f29_remove_slave(struct w1_slave *sl)
+{
+	dev_dbg( &sl->dev, "w1_f29_remove_slave" );
+	dev_dbg( &sl->dev, "family_data: before: 0x%08x", ( unsigned int ) sl->family_data );
+	if ( sl->family_data != NULL )
+	{
+		kfree(sl->family_data);
+		sl->family_data = NULL;
+	}
+	dev_dbg( &sl->dev, "family_data:  after: 0x%08x", ( unsigned int ) sl->family_data );
+}
+
+/*
+Add a new file, "block," to support multi-byte write operations.
+*/
 static BIN_ATTR_RO(state, 1);
 static BIN_ATTR_RW(output, 1);
+static BIN_ATTR_RW(block, W1_F29_BLOCK_WRITE_MAX);
 static BIN_ATTR_RW(activity, 1);
 static BIN_ATTR_RO(cond_search_mask, 1);
 static BIN_ATTR_RO(cond_search_polarity, 1);
@@ -326,6 +500,7 @@ static BIN_ATTR_RW(status_control, 1);
 static struct bin_attribute *w1_f29_bin_attrs[] = {
 	&bin_attr_state,
 	&bin_attr_output,
+	&bin_attr_block,
 	&bin_attr_activity,
 	&bin_attr_cond_search_mask,
 	&bin_attr_cond_search_polarity,
@@ -343,7 +518,8 @@ static const struct attribute_group *w1_f29_groups[] = {
 };
 
 static struct w1_family_ops w1_f29_fops = {
-	.add_slave      = w1_f29_disable_test_mode,
+	.add_slave      = w1_f29_add_slave,
+	.remove_slave = w1_f29_remove_slave,
 	.groups		= w1_f29_groups,
 };
 

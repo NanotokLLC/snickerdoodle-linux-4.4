@@ -566,4 +566,10 @@ config DMATEST
 config DMA_ENGINE_RAID
 	bool
 
+config DMA_CORE100
+	tristate "CORE100 driver"
+	depends on DMA_ENGINE
+	help
+	  "Simple DMA circular buffer for core100 FIFO(s)"
+
 endif
